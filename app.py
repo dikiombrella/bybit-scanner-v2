@@ -14,11 +14,15 @@ st.set_page_config(
 st.title("📈 Bybit Futures: Compression & Breakout Scanner")
 st.markdown("Scansione in tempo reale dei contratti USDT Perpetual con notifica automatica su Telegram.")
 
+# API Keys Bybit caricate direttamente
+BYBIT_API_KEY = "zKgXLLBfZFC9pBd0w0"
+BYBIT_API_SECRET = "nCmAO4UdEKSj3KEIP2G7HIBCLNZISrh2c8h8"
+
 # Parametri Sidebar
 st.sidebar.header("⚙️ Parametri Scanner")
 LOOKBACK_DAYS = st.sidebar.number_input("Giorni Lateralizzazione (Daily)", value=120, min_value=30, max_value=365)
 MAX_RANGE_PCT = st.sidebar.slider("Ampiezza Max Range (%)", min_value=10.0, max_value=50.0, value=35.0, step=1.0)
-MIN_VOLUME_M = st.sidebar.number_input("Volume Minimo 24h (Milioni $)", value=3.0, min_value=0.5, step=0.5)
+MIN_VOLUME_M = st.sidebar.number_input("Volume Minimo 24h (Milioni $)", value=5.0, min_value=1.0, step=1.0)
 MIN_VOLUME_USDT = MIN_VOLUME_M * 1_000_000
 
 st.sidebar.header("📲 Configurazione Telegram")
@@ -37,37 +41,38 @@ def send_telegram_message(token, chat_id, text):
     except Exception:
         return False
 
-# Cache della connessione a Bybit per evitare richieste ripetute
-@st.cache_data(ttl=1800)
-def get_exchange():
-    return ccxt.bybit({'enableRateLimit': True})
+def init_exchange():
+    config = {
+        'enableRateLimit': True,
+        'apiKey': BYBIT_API_KEY,
+        'secret': BYBIT_API_SECRET
+    }
+    return ccxt.bybit(config)
 
 def run_scan():
-    exchange = get_exchange()
+    exchange = init_exchange()
     
-    # Caricamento dei mercati con sistema di retry
+    # Tentativi caricamento mercati autenticati
     markets = None
     for attempt in range(3):
         try:
             markets = exchange.load_markets()
             break
         except Exception:
-            time.sleep(2)
+            time.sleep(1)
             
     if not markets:
-        st.error("Bybit sta temporaneamente limitando le connessioni. Attendi 30 secondi e riprova.")
+        st.error("Impossibile connettersi a Bybit. Verifica la connessione o attendi qualche secondo.")
         return pd.DataFrame()
 
-    # Selezione solo USDT Perps attivi
     symbols = [
         s for s, m in markets.items() 
         if m.get('linear') and m.get('settle') == 'USDT' and m.get('active')
     ]
     
     status_text = st.empty()
-    status_text.text("📥 Scaricamento volumi di mercato in blocco...")
+    status_text.text("📥 Recupero volumi di mercato in corso...")
     
-    # Recupero unico in blocco per azzerare le chiamate API
     try:
         tickers = exchange.fetch_tickers(symbols)
     except Exception:
@@ -75,10 +80,10 @@ def run_scan():
         try:
             tickers = exchange.fetch_tickers(symbols)
         except Exception:
-            st.error("Errore nel recupero dei prezzi da Bybit. Riprova tra poco.")
+            st.error("Errore nel recupero dati da Bybit. Riprova tra poco.")
             return pd.DataFrame()
 
-    # Filtra prima per volume minimo per evitare chiamate inutili sulle candele
+    # Filtra prima le crypto per volume minimo
     filtered_symbols = []
     for sym, tick in tickers.items():
         quote_vol = tick.get('quoteVolume', 0) or 0
@@ -89,11 +94,16 @@ def run_scan():
     progress_bar = st.progress(0)
     total = len(filtered_symbols)
     
+    if total == 0:
+        status_text.empty()
+        progress_bar.empty()
+        return pd.DataFrame()
+
     for idx, (symbol, quote_volume) in enumerate(filtered_symbols):
         status_text.text(f"Analisi grafica {idx+1}/{total}: {symbol}")
         progress_bar.progress((idx + 1) / total)
         
-        # Pausa di sicurezza
+        # Pausa tra le richieste
         time.sleep(0.15)
         
         try:
@@ -145,6 +155,9 @@ def run_scan():
                         f"🔗 [Apri Grafico su Bybit](https://www.bybit.com/trade/usdt/{clean_symbol})"
                     )
                     send_telegram_message(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, msg)
+        except ccxt.RateLimitExceeded:
+            time.sleep(2)
+            continue
         except Exception:
             continue
 
