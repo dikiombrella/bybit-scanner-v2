@@ -2,10 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests
 import time
-import hmac
-import hashlib
 
-# Configurazione Pagina Web
 st.set_page_config(
     page_title="Bybit Futures Breakout Scanner",
     page_icon="📈",
@@ -15,11 +12,6 @@ st.set_page_config(
 st.title("📈 Bybit Futures: Compression & Breakout Scanner")
 st.markdown("Scansione in tempo reale dei contratti USDT Perpetual con notifica automatica su Telegram.")
 
-# API Keys
-BYBIT_API_KEY = "zKgXLLBfZFC9pBd0w0"
-BYBIT_API_SECRET = "nCmAO4UdEKSj3KEIP2G7HIBCLNZISrh2c8h8"
-
-# Parametri Sidebar
 st.sidebar.header("⚙️ Parametri Scanner")
 LOOKBACK_DAYS = st.sidebar.number_input("Giorni Lateralizzazione (Daily)", value=120, min_value=30, max_value=365)
 MAX_RANGE_PCT = st.sidebar.slider("Ampiezza Max Range (%)", min_value=10.0, max_value=50.0, value=35.0, step=1.0)
@@ -31,25 +23,14 @@ ENABLE_TELEGRAM = st.sidebar.checkbox("Attiva Notifiche Telegram", value=False)
 TELEGRAM_TOKEN = st.sidebar.text_input("Bot Token Telegram", type="password")
 TELEGRAM_CHAT_ID = st.sidebar.text_input("Chat ID Telegram")
 
-BASE_URL = "https://api.bybit.com"
+# Endpoint con proxy mirror / bypass geoblock
+BYBIT_API_URL = "https://api.bybit.com"
 
-def get_auth_headers(params_str=""):
-    timestamp = str(int(time.time() * 1000))
-    recv_window = "10000"
-    raw_str = timestamp + BYBIT_API_KEY + recv_window + params_str
-    signature = hmac.new(
-        BYBIT_API_SECRET.encode('utf-8'),
-        raw_str.encode('utf-8'),
-        hashlib.sha256
-    ).hexdigest()
-    
-    return {
-        "X-BAPI-API-KEY": BYBIT_API_KEY,
-        "X-BAPI-SIGN": signature,
-        "X-BAPI-TIMESTAMP": timestamp,
-        "X-BAPI-RECV-WINDOW": recv_window,
-        "Content-Type": "application/json"
-    }
+# Lista di endpoint mirror/proxy pubblici o alternativi per Bybit
+MIRRORS = [
+    "https://api.bybit.com",
+    "https://api.bytick.com"  # Dominio alternativo ufficiale di Bybit per regioni soggette a filtri/block
+]
 
 def send_telegram_message(token, chat_id, text):
     if not token or not chat_id:
@@ -62,56 +43,57 @@ def send_telegram_message(token, chat_id, text):
     except Exception:
         return False
 
+def make_request(endpoint, params):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    for base_url in MIRRORS:
+        url = f"{base_url}{endpoint}"
+        try:
+            res = requests.get(url, params=params, headers=headers, timeout=8)
+            if res.status_code == 200:
+                data = res.json()
+                if data.get("retCode") == 0:
+                    return data
+        except Exception:
+            continue
+    return None
+
 def fetch_bybit_tickers():
-    url = f"{BASE_URL}/v5/market/tickers"
-    query_params = "category=linear"
-    full_url = f"{url}?{query_params}"
-    
-    headers = get_auth_headers(query_params)
-    
-    try:
-        res = requests.get(full_url, headers=headers, timeout=10)
-        data = res.json()
-        if data.get("retCode") == 0:
-            list_tickers = data.get("result", {}).get("list", [])
-            return [t for t in list_tickers if t["symbol"].endswith("USDT")]
-        return []
-    except Exception:
-        return []
+    data = make_request("/v5/market/tickers", {"category": "linear"})
+    if data:
+        list_tickers = data.get("result", {}).get("list", [])
+        return [t for t in list_tickers if t["symbol"].endswith("USDT")]
+    return []
 
 def fetch_klines(symbol, limit):
-    url = f"{BASE_URL}/v5/market/kline"
-    query_params = f"category=linear&symbol={symbol}&interval=D&limit={limit}"
-    full_url = f"{url}?{query_params}"
-    
-    headers = get_auth_headers(query_params)
-    
-    try:
-        res = requests.get(full_url, headers=headers, timeout=10)
-        data = res.json()
-        if data.get("retCode") == 0:
-            raw_klines = data.get("result", {}).get("list", [])
-            raw_klines.reverse()
-            parsed = []
-            for k in raw_klines:
-                parsed.append({
-                    "high": float(k[2]),
-                    "low": float(k[3]),
-                    "close": float(k[4])
-                })
-            return parsed
-        return []
-    except Exception:
-        return []
+    data = make_request("/v5/market/kline", {
+        "category": "linear",
+        "symbol": symbol,
+        "interval": "D",
+        "limit": limit
+    })
+    if data:
+        raw_klines = data.get("result", {}).get("list", [])
+        raw_klines.reverse()
+        parsed = []
+        for k in raw_klines:
+            parsed.append({
+                "high": float(k[2]),
+                "low": float(k[3]),
+                "close": float(k[4])
+            })
+        return parsed
+    return []
 
 def run_scan():
     status_text = st.empty()
-    status_text.text("🔑 Autenticazione API Bybit V5 in corso...")
+    status_text.text("📡 Connessione ai server Bybit (via Bytick Mirror)...")
     
     tickers = fetch_bybit_tickers()
     
     if not tickers:
-        st.error("I server di Bybit continuano a rifiutare la connessione dal cloud. Prova a cliccare su 'Manage App' -> 'Reboot' in basso a destra per cambiare IP del server.")
+        st.error("Raggiunto il blocco IP geografico di Bybit sugli IP statunitensi di Streamlit Cloud. Per un funzionamento fluido al 100%, esegui lo script in locale sul tuo PC con 'streamlit run app.py' oppure usa un VPS europeo.")
         return pd.DataFrame()
 
     filtered_tickers = []
