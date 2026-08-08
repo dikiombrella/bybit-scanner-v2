@@ -2,6 +2,7 @@ import streamlit as st
 import ccxt
 import pandas as pd
 import requests
+import time
 
 # Configurazione Pagina Web
 st.set_page_config(
@@ -37,8 +38,18 @@ def send_telegram_message(token, chat_id, text):
         return False
 
 def run_scan():
-    exchange = ccxt.bybit({'enableRateLimit': True})
-    markets = exchange.load_markets()
+    exchange = ccxt.bybit({
+        'enableRateLimit': True,
+        'options': {'defaultType': 'linear'}
+    })
+    
+    # Caricamento mercati con gestione rate limit
+    try:
+        markets = exchange.load_markets()
+    except ccxt.RateLimitExceeded:
+        time.sleep(2)
+        markets = exchange.load_markets()
+
     symbols = [
         s for s, m in markets.items() 
         if m.get('linear') and m.get('settle') == 'USDT' and m.get('active')
@@ -52,6 +63,9 @@ def run_scan():
     for idx, symbol in enumerate(symbols):
         status_text.text(f"Scansione {idx+1}/{total}: {symbol}")
         progress_bar.progress((idx + 1) / total)
+        
+        # Micro-pausa per evitare blocchi da Bybit
+        time.sleep(0.1)
         
         try:
             ticker = exchange.fetch_ticker(symbol)
@@ -108,6 +122,9 @@ def run_scan():
                     )
                     send_telegram_message(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, msg)
                     
+        except ccxt.RateLimitExceeded:
+            time.sleep(2)
+            continue
         except Exception:
             continue
             
