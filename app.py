@@ -1,5 +1,4 @@
 import streamlit as st
-import ccxt
 import pandas as pd
 import requests
 import time
@@ -14,10 +13,6 @@ st.set_page_config(
 st.title("📈 Bybit Futures: Compression & Breakout Scanner")
 st.markdown("Scansione in tempo reale dei contratti USDT Perpetual con notifica automatica su Telegram.")
 
-# API Keys Bybit
-BYBIT_API_KEY = "zKgXLLBfZFC9pBd0w0"
-BYBIT_API_SECRET = "nCmAO4UdEKSj3KEIP2G7HIBCLNZISrh2c8h8"
-
 # Parametri Sidebar
 st.sidebar.header("⚙️ Parametri Scanner")
 LOOKBACK_DAYS = st.sidebar.number_input("Giorni Lateralizzazione (Daily)", value=120, min_value=30, max_value=365)
@@ -30,6 +25,8 @@ ENABLE_TELEGRAM = st.sidebar.checkbox("Attiva Notifiche Telegram", value=False)
 TELEGRAM_TOKEN = st.sidebar.text_input("Bot Token Telegram", type="password")
 TELEGRAM_CHAT_ID = st.sidebar.text_input("Chat ID Telegram")
 
+BASE_URL = "https://api.bybit.com"
+
 def send_telegram_message(token, chat_id, text):
     if not token or not chat_id:
         return False
@@ -41,129 +38,134 @@ def send_telegram_message(token, chat_id, text):
     except Exception:
         return False
 
-def get_bybit_instance():
-    return ccxt.bybit({
-        'enableRateLimit': True,
-        'apiKey': BYBIT_API_KEY,
-        'secret': BYBIT_API_SECRET,
-        'options': {
-            'defaultType': 'linear'
-        }
-    })
-
-def run_scan():
-    exchange = get_bybit_instance()
+def fetch_bybit_tickers():
+    """Recupera tutti i ticker Linear (USDT Perpetual) direttamente via HTTP API V5."""
+    url = f"{BASE_URL}/v5/market/tickers"
+    params = {"category": "linear"}
     
-    status_text = st.empty()
-    status_text.text("🔌 Connessione a Bybit V5 API in corso...")
-    
-    # Caricamento mercati con retries progressivi
-    markets = None
-    for attempt in range(4):
-        try:
-            markets = exchange.load_markets()
-            if markets:
-                break
-        except Exception as e:
-            time.sleep(3 * (attempt + 1))
-            
-    if not markets:
-        st.error("I server di Bybit stanno bloccando temporaneamente le richieste da Streamlit Cloud. Attendi 2-3 minuti affinché il blocco temporaneo scada, poi riprova.")
-        return pd.DataFrame()
-
-    symbols = [
-        s for s, m in markets.items() 
-        if m.get('linear') and m.get('settle') == 'USDT' and m.get('active')
-    ]
-    
-    status_text.text("📥 Recupero dei volumi 24h...")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    }
     
     try:
-        tickers = exchange.fetch_tickers(symbols)
+        res = requests.get(url, params=params, headers=headers, timeout=10)
+        data = res.json()
+        if data.get("retCode") == 0:
+            list_tickers = data.get("result", {}).get("list", [])
+            # Filtra solo le coppie USDT
+            return [t for t in list_tickers if t["symbol"].endswith("USDT")]
+        else:
+            return []
     except Exception:
-        time.sleep(3)
-        try:
-            tickers = exchange.fetch_tickers(symbols)
-        except Exception:
-            st.error("Errore durante il recupero dei volumi di mercato. Riprova tra poco.")
-            return pd.DataFrame()
+        return []
 
-    filtered_symbols = []
-    for sym, tick in tickers.items():
-        quote_vol = tick.get('quoteVolume', 0) or 0
-        if quote_vol >= MIN_VOLUME_USDT:
-            filtered_symbols.append((sym, quote_vol))
+def fetch_klines(symbol, limit):
+    """Scarica le candele Daily per una singola crypto."""
+    url = f"{BASE_URL}/v5/market/kline"
+    params = {
+        "category": "linear",
+        "symbol": symbol,
+        "interval": "D",
+        "limit": limit
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    }
+    
+    try:
+        res = requests.get(url, params=params, headers=headers, timeout=10)
+        data = res.json()
+        if data.get("retCode") == 0:
+            raw_klines = data.get("result", {}).get("list", [])
+            # Le candele arrivano ordinate dalla più recente alla più vecchia, le invertiamo
+            raw_klines.reverse()
+            parsed = []
+            for k in raw_klines:
+                parsed.append({
+                    "high": float(k[2]),
+                    "low": float(k[3]),
+                    "close": float(k[4])
+                })
+            return parsed
+        return []
+    except Exception:
+        return []
+
+def run_scan():
+    status_text = st.empty()
+    status_text.text("📡 Connessione a Bybit V5 API via HTTP Direct...")
+    
+    tickers = fetch_bybit_tickers()
+    
+    if not tickers:
+        st.error("I server di Bybit stanno bloccando temporaneamente le chiamate pubbliche da questo IP di Streamlit Cloud. Prova a riavviare l'app da 'Manage App' -> 'Reboot' in basso a destra.")
+        return pd.DataFrame()
+
+    # Filtra solo i ticker sopra il volume minimo impostato
+    filtered_tickers = []
+    for t in tickers:
+        try:
+            quote_volume = float(t.get("turnover24h", 0))
+            if quote_volume >= MIN_VOLUME_USDT:
+                filtered_tickers.append((t["symbol"], quote_volume, float(t.get("lastPrice", 0))))
+        except (ValueError, TypeError):
+            continue
 
     results = []
     progress_bar = st.progress(0)
-    total = len(filtered_symbols)
+    total = len(filtered_tickers)
     
     if total == 0:
         status_text.empty()
         progress_bar.empty()
+        st.warning("Nessuna coppia trovata con il volume minimo specificato.")
         return pd.DataFrame()
 
-    for idx, (symbol, quote_volume) in enumerate(filtered_symbols):
-        status_text.text(f"Scansione grafico {idx+1}/{total}: {symbol}")
+    for idx, (symbol, quote_volume, last_price) in enumerate(filtered_tickers):
+        status_text.text(f"Analisi grafico {idx+1}/{total}: {symbol}")
         progress_bar.progress((idx + 1) / total)
         
-        # Pausa per rispettare il rate limit
-        time.sleep(0.2)
+        # Pausa di cortesia
+        time.sleep(0.12)
         
-        try:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1d', limit=LOOKBACK_DAYS + 10)
-            if len(ohlcv) < LOOKBACK_DAYS:
-                continue
-                
-            df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
-            df_range = df.iloc[-LOOKBACK_DAYS:]
-            
-            highest_high = df_range['high'].max()
-            lowest_low = df_range['low'].min()
-            current_close = df['close'].iloc[-1]
-            
-            range_pct = ((highest_high - lowest_low) / lowest_low) * 100
-            proximity = ((current_close - lowest_low) / (highest_high - lowest_low)) * 100
-            
-            if range_pct <= MAX_RANGE_PCT:
-                try:
-                    oi_fetch = exchange.fetch_open_interest(symbol)
-                    oi_amount = oi_fetch.get('openInterestAmount', 0) or 0
-                    oi_usdt = oi_amount * current_close
-                except Exception:
-                    oi_usdt = 0
-                    
-                oi_ratio = (oi_usdt / quote_volume) if quote_volume > 0 else 0
-                clean_symbol = symbol.replace(':USDT', '')
-                
-                res = {
-                    'Symbol': clean_symbol,
-                    'Prezzo ($)': current_close,
-                    'Range Ampiezza (%)': round(range_pct, 2),
-                    'Prossimità Breakout (%)': round(proximity, 1),
-                    'Volume 24h (M$)': round(quote_volume / 1_000_000, 2),
-                    'Open Interest (M$)': round(oi_usdt / 1_000_000, 2),
-                    'Ratio OI/Vol': round(oi_ratio, 2)
-                }
-                results.append(res)
-                
-                if ENABLE_TELEGRAM and proximity >= 85.0:
-                    msg = (
-                        f"🚨 *POSSIBILE BREAKOUT IMMINENTE!*\n\n"
-                        f"📌 *Coppia:* `{clean_symbol}`\n"
-                        f"💰 *Prezzo Attuale:* `{current_close}` $\n"
-                        f"📏 *Ampiezza Range {LOOKBACK_DAYS}d:* `{round(range_pct, 2)}%`\n"
-                        f"🎯 *Prossimità Resistenza:* `{round(proximity, 1)}%`\n"
-                        f"📊 *Volume 24h:* `{round(quote_volume / 1_000_000, 2)} M$`\n"
-                        f"🔥 *Open Interest:* `{round(oi_usdt / 1_000_000, 2)} M$`\n\n"
-                        f"🔗 [Apri Grafico su Bybit](https://www.bybit.com/trade/usdt/{clean_symbol})"
-                    )
-                    send_telegram_message(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, msg)
-        except ccxt.RateLimitExceeded:
-            time.sleep(3)
+        klines = fetch_klines(symbol, LOOKBACK_DAYS + 10)
+        if len(klines) < LOOKBACK_DAYS:
             continue
-        except Exception:
+            
+        df = pd.DataFrame(klines)
+        df_range = df.iloc[-LOOKBACK_DAYS:]
+        
+        highest_high = df_range['high'].max()
+        lowest_low = df_range['low'].min()
+        current_close = df['close'].iloc[-1]
+        
+        if lowest_low <= 0 or (highest_high - lowest_low) <= 0:
             continue
+
+        range_pct = ((highest_high - lowest_low) / lowest_low) * 100
+        proximity = ((current_close - lowest_low) / (highest_high - lowest_low)) * 100
+        
+        if range_pct <= MAX_RANGE_PCT:
+            res = {
+                'Symbol': symbol,
+                'Prezzo ($)': current_close,
+                'Range Ampiezza (%)': round(range_pct, 2),
+                'Prossimità Breakout (%)': round(proximity, 1),
+                'Volume 24h (M$)': round(quote_volume / 1_000_000, 2)
+            }
+            results.append(res)
+            
+            if ENABLE_TELEGRAM and proximity >= 85.0:
+                msg = (
+                    f"🚨 *POSSIBILE BREAKOUT IMMINENTE!*\n\n"
+                    f"📌 *Coppia:* `{symbol}`\n"
+                    f"💰 *Prezzo Attuale:* `{current_close}` $\n"
+                    f"📏 *Ampiezza Range {LOOKBACK_DAYS}d:* `{round(range_pct, 2)}%`\n"
+                    f"🎯 *Prossimità Resistenza:* `{round(proximity, 1)}%`\n"
+                    f"📊 *Volume 24h:* `{round(quote_volume / 1_000_000, 2)} M$`\n\n"
+                    f"🔗 [Apri Grafico su Bybit](https://www.bybit.com/trade/usdt/{symbol})"
+                )
+                send_telegram_message(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, msg)
 
     status_text.empty()
     progress_bar.empty()
@@ -179,5 +181,3 @@ if st.button("🚀 Avvia Scansione Ora", type="primary"):
                 df_sorted.style.background_gradient(subset=['Prossimità Breakout (%)'], cmap='Greens'),
                 use_container_width=True
             )
-        else:
-            st.warning("Nessuna crypto trovata con i parametri selezionati.")
