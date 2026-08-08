@@ -14,7 +14,7 @@ st.set_page_config(
 st.title("📈 Bybit Futures: Compression & Breakout Scanner")
 st.markdown("Scansione in tempo reale dei contratti USDT Perpetual con notifica automatica su Telegram.")
 
-# API Keys Bybit caricate direttamente
+# API Keys Bybit
 BYBIT_API_KEY = "zKgXLLBfZFC9pBd0w0"
 BYBIT_API_SECRET = "nCmAO4UdEKSj3KEIP2G7HIBCLNZISrh2c8h8"
 
@@ -41,28 +41,34 @@ def send_telegram_message(token, chat_id, text):
     except Exception:
         return False
 
-def init_exchange():
-    config = {
+def get_bybit_instance():
+    return ccxt.bybit({
         'enableRateLimit': True,
         'apiKey': BYBIT_API_KEY,
-        'secret': BYBIT_API_SECRET
-    }
-    return ccxt.bybit(config)
+        'secret': BYBIT_API_SECRET,
+        'options': {
+            'defaultType': 'linear'
+        }
+    })
 
 def run_scan():
-    exchange = init_exchange()
+    exchange = get_bybit_instance()
     
-    # Tentativi caricamento mercati autenticati
+    status_text = st.empty()
+    status_text.text("🔌 Connessione a Bybit V5 API in corso...")
+    
+    # Caricamento mercati con retries progressivi
     markets = None
-    for attempt in range(3):
+    for attempt in range(4):
         try:
             markets = exchange.load_markets()
-            break
-        except Exception:
-            time.sleep(1)
+            if markets:
+                break
+        except Exception as e:
+            time.sleep(3 * (attempt + 1))
             
     if not markets:
-        st.error("Impossibile connettersi a Bybit. Verifica la connessione o attendi qualche secondo.")
+        st.error("I server di Bybit stanno bloccando temporaneamente le richieste da Streamlit Cloud. Attendi 2-3 minuti affinché il blocco temporaneo scada, poi riprova.")
         return pd.DataFrame()
 
     symbols = [
@@ -70,20 +76,18 @@ def run_scan():
         if m.get('linear') and m.get('settle') == 'USDT' and m.get('active')
     ]
     
-    status_text = st.empty()
-    status_text.text("📥 Recupero volumi di mercato in corso...")
+    status_text.text("📥 Recupero dei volumi 24h...")
     
     try:
         tickers = exchange.fetch_tickers(symbols)
     except Exception:
-        time.sleep(2)
+        time.sleep(3)
         try:
             tickers = exchange.fetch_tickers(symbols)
         except Exception:
-            st.error("Errore nel recupero dati da Bybit. Riprova tra poco.")
+            st.error("Errore durante il recupero dei volumi di mercato. Riprova tra poco.")
             return pd.DataFrame()
 
-    # Filtra prima le crypto per volume minimo
     filtered_symbols = []
     for sym, tick in tickers.items():
         quote_vol = tick.get('quoteVolume', 0) or 0
@@ -100,11 +104,11 @@ def run_scan():
         return pd.DataFrame()
 
     for idx, (symbol, quote_volume) in enumerate(filtered_symbols):
-        status_text.text(f"Analisi grafica {idx+1}/{total}: {symbol}")
+        status_text.text(f"Scansione grafico {idx+1}/{total}: {symbol}")
         progress_bar.progress((idx + 1) / total)
         
-        # Pausa tra le richieste
-        time.sleep(0.15)
+        # Pausa per rispettare il rate limit
+        time.sleep(0.2)
         
         try:
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1d', limit=LOOKBACK_DAYS + 10)
@@ -156,7 +160,7 @@ def run_scan():
                     )
                     send_telegram_message(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, msg)
         except ccxt.RateLimitExceeded:
-            time.sleep(2)
+            time.sleep(3)
             continue
         except Exception:
             continue
