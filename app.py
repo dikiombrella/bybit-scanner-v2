@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import requests
 import time
+import hmac
+import hashlib
 
 # Configurazione Pagina Web
 st.set_page_config(
@@ -12,6 +14,10 @@ st.set_page_config(
 
 st.title("📈 Bybit Futures: Compression & Breakout Scanner")
 st.markdown("Scansione in tempo reale dei contratti USDT Perpetual con notifica automatica su Telegram.")
+
+# API Keys
+BYBIT_API_KEY = "zKgXLLBfZFC9pBd0w0"
+BYBIT_API_SECRET = "nCmAO4UdEKSj3KEIP2G7HIBCLNZISrh2c8h8"
 
 # Parametri Sidebar
 st.sidebar.header("⚙️ Parametri Scanner")
@@ -27,6 +33,24 @@ TELEGRAM_CHAT_ID = st.sidebar.text_input("Chat ID Telegram")
 
 BASE_URL = "https://api.bybit.com"
 
+def get_auth_headers(params_str=""):
+    timestamp = str(int(time.time() * 1000))
+    recv_window = "10000"
+    raw_str = timestamp + BYBIT_API_KEY + recv_window + params_str
+    signature = hmac.new(
+        BYBIT_API_SECRET.encode('utf-8'),
+        raw_str.encode('utf-8'),
+        hashlib.sha256
+    ).hexdigest()
+    
+    return {
+        "X-BAPI-API-KEY": BYBIT_API_KEY,
+        "X-BAPI-SIGN": signature,
+        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-RECV-WINDOW": recv_window,
+        "Content-Type": "application/json"
+    }
+
 def send_telegram_message(token, chat_id, text):
     if not token or not chat_id:
         return False
@@ -39,45 +63,34 @@ def send_telegram_message(token, chat_id, text):
         return False
 
 def fetch_bybit_tickers():
-    """Recupera tutti i ticker Linear (USDT Perpetual) direttamente via HTTP API V5."""
     url = f"{BASE_URL}/v5/market/tickers"
-    params = {"category": "linear"}
+    query_params = "category=linear"
+    full_url = f"{url}?{query_params}"
     
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-    }
+    headers = get_auth_headers(query_params)
     
     try:
-        res = requests.get(url, params=params, headers=headers, timeout=10)
+        res = requests.get(full_url, headers=headers, timeout=10)
         data = res.json()
         if data.get("retCode") == 0:
             list_tickers = data.get("result", {}).get("list", [])
-            # Filtra solo le coppie USDT
             return [t for t in list_tickers if t["symbol"].endswith("USDT")]
-        else:
-            return []
+        return []
     except Exception:
         return []
 
 def fetch_klines(symbol, limit):
-    """Scarica le candele Daily per una singola crypto."""
     url = f"{BASE_URL}/v5/market/kline"
-    params = {
-        "category": "linear",
-        "symbol": symbol,
-        "interval": "D",
-        "limit": limit
-    }
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-    }
+    query_params = f"category=linear&symbol={symbol}&interval=D&limit={limit}"
+    full_url = f"{url}?{query_params}"
+    
+    headers = get_auth_headers(query_params)
     
     try:
-        res = requests.get(url, params=params, headers=headers, timeout=10)
+        res = requests.get(full_url, headers=headers, timeout=10)
         data = res.json()
         if data.get("retCode") == 0:
             raw_klines = data.get("result", {}).get("list", [])
-            # Le candele arrivano ordinate dalla più recente alla più vecchia, le invertiamo
             raw_klines.reverse()
             parsed = []
             for k in raw_klines:
@@ -93,15 +106,14 @@ def fetch_klines(symbol, limit):
 
 def run_scan():
     status_text = st.empty()
-    status_text.text("📡 Connessione a Bybit V5 API via HTTP Direct...")
+    status_text.text("🔑 Autenticazione API Bybit V5 in corso...")
     
     tickers = fetch_bybit_tickers()
     
     if not tickers:
-        st.error("I server di Bybit stanno bloccando temporaneamente le chiamate pubbliche da questo IP di Streamlit Cloud. Prova a riavviare l'app da 'Manage App' -> 'Reboot' in basso a destra.")
+        st.error("I server di Bybit continuano a rifiutare la connessione dal cloud. Prova a cliccare su 'Manage App' -> 'Reboot' in basso a destra per cambiare IP del server.")
         return pd.DataFrame()
 
-    # Filtra solo i ticker sopra il volume minimo impostato
     filtered_tickers = []
     for t in tickers:
         try:
@@ -125,8 +137,7 @@ def run_scan():
         status_text.text(f"Analisi grafico {idx+1}/{total}: {symbol}")
         progress_bar.progress((idx + 1) / total)
         
-        # Pausa di cortesia
-        time.sleep(0.12)
+        time.sleep(0.1)
         
         klines = fetch_klines(symbol, LOOKBACK_DAYS + 10)
         if len(klines) < LOOKBACK_DAYS:
